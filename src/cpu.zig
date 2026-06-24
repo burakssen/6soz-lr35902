@@ -1,5 +1,4 @@
 const std = @import("std");
-const Bus = @import("bus.zig");
 
 const Cpu = @This();
 
@@ -38,7 +37,7 @@ pub fn reset(self: *Cpu) void {
     self.* = .{};
 }
 
-pub fn step(self: *Cpu, bus: *Bus, interrupt_enable: u8, interrupt_flags: *u8) Error!StepResult {
+pub fn step(self: *Cpu, bus: anytype, interrupt_enable: u8, interrupt_flags: *u8) Error!StepResult {
     const pending = interrupt_enable & interrupt_flags.* & 0x1f;
     self.interrupt_pending = pending != 0;
     if (pending != 0) {
@@ -65,7 +64,7 @@ pub fn step(self: *Cpu, bus: *Bus, interrupt_enable: u8, interrupt_flags: *u8) E
     return .{ .cycles = used };
 }
 
-fn serviceInterrupt(self: *Cpu, bus: *Bus, pending: u8, interrupt_flags: *u8) u8 {
+fn serviceInterrupt(self: *Cpu, bus: anytype, pending: u8, interrupt_flags: *u8) u8 {
     const index: u3 = @intCast(@ctz(pending));
     interrupt_flags.* &= ~(@as(u8, 1) << index);
     self.ime = false;
@@ -82,7 +81,7 @@ fn advanceIme(self: *Cpu) void {
     if (self.ime_delay == 0) self.ime = true;
 }
 
-fn execute(self: *Cpu, bus: *Bus, opcode: u8) Error!u8 {
+fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
     const x = opcode >> 6;
     const y = (opcode >> 3) & 7;
     const z = opcode & 7;
@@ -348,7 +347,7 @@ fn execute(self: *Cpu, bus: *Bus, opcode: u8) Error!u8 {
     };
 }
 
-fn executeCb(self: *Cpu, bus: *Bus, opcode: u8) u8 {
+fn executeCb(self: *Cpu, bus: anytype, opcode: u8) u8 {
     const x = opcode >> 6;
     const y = (opcode >> 3) & 7;
     const z = opcode & 7;
@@ -381,7 +380,7 @@ fn executeCb(self: *Cpu, bus: *Bus, opcode: u8) u8 {
     return if (z == 6) (if (x == 1) 12 else 16) else 8;
 }
 
-fn fetch(self: *Cpu, bus: *Bus) u8 {
+fn fetch(self: *Cpu, bus: anytype) u8 {
     const value = bus.read(self.pc);
     if (self.halt_bug) {
         self.halt_bug = false;
@@ -391,13 +390,13 @@ fn fetch(self: *Cpu, bus: *Bus) u8 {
     return value;
 }
 
-fn fetch16(self: *Cpu, bus: *Bus) u16 {
+fn fetch16(self: *Cpu, bus: anytype) u16 {
     const low = self.fetch(bus);
     const high = self.fetch(bus);
     return @as(u16, low) | (@as(u16, high) << 8);
 }
 
-fn readR(self: *Cpu, bus: *Bus, index: u8) u8 {
+fn readR(self: *Cpu, bus: anytype, index: u8) u8 {
     return switch (index) {
         0 => self.b,
         1 => self.c,
@@ -411,7 +410,7 @@ fn readR(self: *Cpu, bus: *Bus, index: u8) u8 {
     };
 }
 
-fn writeR(self: *Cpu, bus: *Bus, index: u8, value: u8) void {
+fn writeR(self: *Cpu, bus: anytype, index: u8, value: u8) void {
     switch (index) {
         0 => self.b = value,
         1 => self.c = value,
@@ -595,14 +594,14 @@ fn condition(self: *const Cpu, index: u8) bool {
     };
 }
 
-fn push16(self: *Cpu, bus: *Bus, value: u16) void {
+fn push16(self: *Cpu, bus: anytype, value: u16) void {
     self.sp -%= 1;
     bus.write(self.sp, @truncate(value >> 8));
     self.sp -%= 1;
     bus.write(self.sp, @truncate(value));
 }
 
-fn pop16(self: *Cpu, bus: *Bus) u16 {
+fn pop16(self: *Cpu, bus: anytype) u16 {
     const low = bus.read(self.sp);
     self.sp +%= 1;
     const high = bus.read(self.sp);
@@ -709,7 +708,6 @@ const TestMemory = struct {
 
 test "executes arithmetic, memory, CB, call, and return instructions" {
     var memory = TestMemory{};
-    var bus = Bus.init(&memory);
     var cpu = Cpu{ .sp = 0xfffe };
     var interrupt_flags: u8 = 0;
     const program = [_]u8{
@@ -725,7 +723,7 @@ test "executes arithmetic, memory, CB, call, and return instructions" {
     memory.data[0x11] = 0xc9;
 
     var i: usize = 0;
-    while (i < 8) : (i += 1) _ = try cpu.step(&bus, 0, &interrupt_flags);
+    while (i < 8) : (i += 1) _ = try cpu.step(&memory, 0, &interrupt_flags);
 
     try std.testing.expectEqual(@as(u8, 0x02), cpu.a);
     try std.testing.expectEqual(@as(u8, 0x10), memory.data[0xc000]);
@@ -734,45 +732,42 @@ test "executes arithmetic, memory, CB, call, and return instructions" {
 
 test "services interrupts and implements delayed EI" {
     var memory = TestMemory{};
-    var bus = Bus.init(&memory);
     var cpu = Cpu{ .sp = 0xfffe };
     var interrupt_flags: u8 = 1;
     memory.data[0] = 0xfb;
     memory.data[1] = 0x00;
 
-    _ = try cpu.step(&bus, 1, &interrupt_flags);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
     try std.testing.expect(!cpu.ime);
-    _ = try cpu.step(&bus, 1, &interrupt_flags);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
     try std.testing.expect(cpu.ime);
     try std.testing.expectEqual(
         @as(u8, 20),
-        (try cpu.step(&bus, 1, &interrupt_flags)).cycles,
+        (try cpu.step(&memory, 1, &interrupt_flags)).cycles,
     );
     try std.testing.expectEqual(@as(u16, 0x40), cpu.pc);
 }
 
 test "invalid opcodes do not advance pc" {
     var memory = TestMemory{};
-    var bus = Bus.init(&memory);
     var cpu = Cpu{};
     var interrupt_flags: u8 = 0;
     memory.data[0] = 0xd3;
 
-    try std.testing.expectError(Error.InvalidOpcode, cpu.step(&bus, 0, &interrupt_flags));
+    try std.testing.expectError(Error.InvalidOpcode, cpu.step(&memory, 0, &interrupt_flags));
     try std.testing.expectEqual(@as(u16, 0), cpu.pc);
 }
 
 test "HALT bug suppresses one program counter increment" {
     var memory = TestMemory{};
-    var bus = Bus.init(&memory);
     var cpu = Cpu{};
     var interrupt_flags: u8 = 1;
     memory.data[0] = 0x76;
     memory.data[1] = 0x3e;
     memory.data[2] = 0x42;
 
-    _ = try cpu.step(&bus, 1, &interrupt_flags);
-    _ = try cpu.step(&bus, 1, &interrupt_flags);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
 
     try std.testing.expectEqual(@as(u8, 0x3e), cpu.a);
     try std.testing.expectEqual(@as(u16, 2), cpu.pc);
@@ -783,15 +778,14 @@ test "all documented base opcodes decode" {
     var opcode: u16 = 0;
     while (opcode < 256) : (opcode += 1) {
         var memory = TestMemory{};
-        var bus = Bus.init(&memory);
         var cpu = Cpu{ .sp = 0xfffe };
         var interrupt_flags: u8 = 0;
         memory.data[0] = @truncate(opcode);
         const expected_invalid = std.mem.indexOfScalar(u8, &invalid, @truncate(opcode)) != null;
         if (expected_invalid) {
-            try std.testing.expectError(Error.InvalidOpcode, cpu.step(&bus, 0, &interrupt_flags));
+            try std.testing.expectError(Error.InvalidOpcode, cpu.step(&memory, 0, &interrupt_flags));
         } else {
-            _ = try cpu.step(&bus, 0, &interrupt_flags);
+            _ = try cpu.step(&memory, 0, &interrupt_flags);
         }
     }
 }
