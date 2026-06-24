@@ -27,7 +27,8 @@ sp: u16 = 0,
 pc: u16 = 0,
 cycles: u64 = 0,
 ime: bool = false,
-ime_delay: u2 = 0,
+ime_scheduled: bool = false,
+ime_pending: bool = false,
 halted: bool = false,
 stopped: bool = false,
 halt_bug: bool = false,
@@ -43,11 +44,10 @@ pub fn step(self: *Cpu, bus: anytype, interrupt_enable: u8, interrupt_flags: *u8
     if (pending != 0) {
         self.halted = false;
         self.stopped = false;
-        if (self.ime) return .{ .cycles = self.serviceInterrupt(bus, pending, interrupt_flags) };
+        if (self.ime) return .{ .cycles = self.serviceInterrupt(bus, interrupt_flags) };
     }
 
     if (self.halted or self.stopped) {
-        self.advanceIme();
         self.cycles += 4;
         return .{ .cycles = 4 };
     }
@@ -64,21 +64,40 @@ pub fn step(self: *Cpu, bus: anytype, interrupt_enable: u8, interrupt_flags: *u8
     return .{ .cycles = used };
 }
 
-fn serviceInterrupt(self: *Cpu, bus: anytype, pending: u8, interrupt_flags: *u8) u8 {
-    const index: u3 = @intCast(@ctz(pending));
-    interrupt_flags.* &= ~(@as(u8, 1) << index);
+fn serviceInterrupt(self: *Cpu, bus: anytype, interrupt_flags: *u8) u8 {
     self.ime = false;
-    self.ime_delay = 0;
-    self.push16(bus, self.pc);
+    self.ime_scheduled = false;
+    self.ime_pending = false;
+
+    const pc = self.pc;
+    self.sp -%= 1;
+    bus.write(self.sp, @truncate(pc >> 8));
+
+    const enabled_after_high_push = bus.read(0xffff) & interrupt_flags.* & 0x1f;
+    if (enabled_after_high_push == 0) {
+        self.pc = 0;
+        self.cycles += 20;
+        return 20;
+    }
+
+    const index: u3 = @intCast(@ctz(enabled_after_high_push));
+    self.sp -%= 1;
+    bus.write(self.sp, @truncate(pc));
+    interrupt_flags.* &= ~(@as(u8, 1) << index);
     self.pc = 0x40 + @as(u16, index) * 8;
     self.cycles += 20;
     return 20;
 }
 
 fn advanceIme(self: *Cpu) void {
-    if (self.ime_delay == 0) return;
-    self.ime_delay -= 1;
-    if (self.ime_delay == 0) self.ime = true;
+    if (self.ime_pending) {
+        self.ime = true;
+        self.ime_pending = false;
+    }
+    if (self.ime_scheduled) {
+        self.ime_scheduled = false;
+        self.ime_pending = true;
+    }
 }
 
 fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
@@ -257,7 +276,8 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                 1 => blk: {
                     self.pc = self.pop16(bus);
                     self.ime = true;
-                    self.ime_delay = 0;
+                    self.ime_scheduled = false;
+                    self.ime_pending = false;
                     break :blk 16;
                 },
                 2 => blk: {
@@ -305,11 +325,12 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                 1 => self.executeCb(bus, self.fetch(bus)),
                 6 => blk: {
                     self.ime = false;
-                    self.ime_delay = 0;
+                    self.ime_scheduled = false;
+                    self.ime_pending = false;
                     break :blk 4;
                 },
                 7 => blk: {
-                    self.ime_delay = 2;
+                    self.ime_scheduled = true;
                     break :blk 4;
                 },
                 else => Error.InvalidOpcode,
@@ -736,6 +757,7 @@ test "services interrupts and implements delayed EI" {
     var interrupt_flags: u8 = 1;
     memory.data[0] = 0xfb;
     memory.data[1] = 0x00;
+    memory.data[0xffff] = 1;
 
     _ = try cpu.step(&memory, 1, &interrupt_flags);
     try std.testing.expect(!cpu.ime);
@@ -746,6 +768,80 @@ test "services interrupts and implements delayed EI" {
         (try cpu.step(&memory, 1, &interrupt_flags)).cycles,
     );
     try std.testing.expectEqual(@as(u16, 0x40), cpu.pc);
+}
+
+test "DI cancels pending delayed EI" {
+    var memory = TestMemory{};
+    var cpu = Cpu{ .sp = 0xfffe };
+    var interrupt_flags: u8 = 1;
+    memory.data[0] = 0xfb; // EI
+    memory.data[1] = 0xf3; // DI
+    memory.data[2] = 0x00; // NOP
+
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
+    try std.testing.expect(!cpu.ime);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
+    try std.testing.expect(!cpu.ime);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
+    try std.testing.expect(!cpu.ime);
+    try std.testing.expectEqual(@as(u16, 3), cpu.pc);
+}
+
+test "interrupt service pushes current PC and clears request" {
+    var memory = TestMemory{};
+    var cpu = Cpu{ .sp = 0xfffe, .pc = 0x1234, .ime = true };
+    var interrupt_flags: u8 = 0x04;
+    memory.data[0xffff] = 0x04;
+
+    try std.testing.expectEqual(@as(u8, 20), (try cpu.step(&memory, 0x04, &interrupt_flags)).cycles);
+    try std.testing.expectEqual(@as(u16, 0x50), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 0xfffc), cpu.sp);
+    try std.testing.expectEqual(@as(u8, 0x34), memory.data[0xfffc]);
+    try std.testing.expectEqual(@as(u8, 0x12), memory.data[0xfffd]);
+    try std.testing.expectEqual(@as(u8, 0), interrupt_flags & 0x04);
+    try std.testing.expect(!cpu.ime);
+}
+
+test "interrupt dispatch reselects after high PC push writes IE" {
+    var memory = TestMemory{};
+    var cpu = Cpu{ .sp = 0x0000, .pc = 0x0200, .ime = true };
+    var interrupt_flags: u8 = 0x03;
+    memory.data[0xffff] = 0x03;
+
+    try std.testing.expectEqual(@as(u8, 20), (try cpu.step(&memory, 0x03, &interrupt_flags)).cycles);
+    try std.testing.expectEqual(@as(u16, 0x48), cpu.pc);
+    try std.testing.expectEqual(@as(u8, 0x01), interrupt_flags & 0x1f);
+    try std.testing.expectEqual(@as(u8, 0x02), memory.data[0xffff]);
+}
+
+test "interrupt dispatch cancels if high PC push clears all enabled requests" {
+    var memory = TestMemory{};
+    var cpu = Cpu{ .sp = 0x0000, .pc = 0x0200, .ime = true };
+    var interrupt_flags: u8 = 0x04;
+    memory.data[0xffff] = 0x04;
+
+    try std.testing.expectEqual(@as(u8, 20), (try cpu.step(&memory, 0x04, &interrupt_flags)).cycles);
+    try std.testing.expectEqual(@as(u16, 0), cpu.pc);
+    try std.testing.expectEqual(@as(u16, 0xffff), cpu.sp);
+    try std.testing.expectEqual(@as(u8, 0x04), interrupt_flags & 0x1f);
+    try std.testing.expectEqual(@as(u8, 0x02), memory.data[0xffff]);
+}
+
+test "HALT wakes without servicing when IME is disabled" {
+    var memory = TestMemory{};
+    var cpu = Cpu{};
+    var interrupt_flags: u8 = 0;
+    memory.data[0] = 0x76; // HALT
+    memory.data[1] = 0x00; // NOP
+
+    _ = try cpu.step(&memory, 0, &interrupt_flags);
+    try std.testing.expect(cpu.halted);
+    interrupt_flags = 1;
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
+    try std.testing.expect(!cpu.halted);
+    try std.testing.expectEqual(@as(u16, 2), cpu.pc);
+    _ = try cpu.step(&memory, 1, &interrupt_flags);
+    try std.testing.expectEqual(@as(u16, 3), cpu.pc);
 }
 
 test "invalid opcodes do not advance pc" {
