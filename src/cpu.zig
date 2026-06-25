@@ -33,12 +33,14 @@ halted: bool = false,
 stopped: bool = false,
 halt_bug: bool = false,
 interrupt_pending: bool = false,
+step_elapsed_cycles: u8 = 0,
 
 pub fn reset(self: *Cpu) void {
     self.* = .{};
 }
 
 pub fn step(self: *Cpu, bus: anytype, interrupt_enable: u8, interrupt_flags: *u8) Error!StepResult {
+    self.step_elapsed_cycles = 0;
     const pending = interrupt_enable & interrupt_flags.* & 0x1f;
     self.interrupt_pending = pending != 0;
     if (pending != 0) {
@@ -48,6 +50,7 @@ pub fn step(self: *Cpu, bus: anytype, interrupt_enable: u8, interrupt_flags: *u8
     }
 
     if (self.halted or self.stopped) {
+        self.tick(bus, 4);
         self.cycles += 4;
         return .{ .cycles = 4 };
     }
@@ -58,6 +61,7 @@ pub fn step(self: *Cpu, bus: anytype, interrupt_enable: u8, interrupt_flags: *u8
         self.pc = initial_pc;
         return err;
     };
+    self.tickRemainder(bus, used);
     self.advanceIme();
     self.f &= 0xf0;
     self.cycles += used;
@@ -70,21 +74,24 @@ fn serviceInterrupt(self: *Cpu, bus: anytype, interrupt_flags: *u8) u8 {
     self.ime_pending = false;
 
     const pc = self.pc;
+    self.tick(bus, 8);
     self.sp -%= 1;
-    bus.write(self.sp, @truncate(pc >> 8));
+    self.writeBus(bus, self.sp, @truncate(pc >> 8));
 
     const enabled_after_high_push = bus.read(0xffff) & interrupt_flags.* & 0x1f;
     if (enabled_after_high_push == 0) {
         self.pc = 0;
+        self.tickRemainder(bus, 20);
         self.cycles += 20;
         return 20;
     }
 
     const index: u3 = @intCast(@ctz(enabled_after_high_push));
     self.sp -%= 1;
-    bus.write(self.sp, @truncate(pc));
+    self.writeBus(bus, self.sp, @truncate(pc));
     interrupt_flags.* &= ~(@as(u8, 1) << index);
     self.pc = 0x40 + @as(u16, index) * 8;
+    self.tickRemainder(bus, 20);
     self.cycles += 20;
     return 20;
 }
@@ -113,8 +120,8 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                 0 => 4,
                 1 => blk: {
                     const address = self.fetch16(bus);
-                    bus.write(address, @truncate(self.sp));
-                    bus.write(address +% 1, @truncate(self.sp >> 8));
+                    self.writeBus(bus, address, @truncate(self.sp));
+                    self.writeBus(bus, address +% 1, @truncate(self.sp >> 8));
                     break :blk 20;
                 },
                 2 => blk: {
@@ -151,9 +158,9 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                     else => unreachable,
                 };
                 if (q == 0) {
-                    bus.write(address, self.a);
+                    self.writeBus(bus, address, self.a);
                 } else {
-                    self.a = bus.read(address);
+                    self.a = self.readBus(bus, address);
                 }
                 if (p == 2) self.setHl(address +% 1);
                 if (p == 3) self.setHl(address -% 1);
@@ -246,7 +253,7 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                     break :blk 8;
                 },
                 4 => blk: {
-                    bus.write(0xff00 | @as(u16, self.fetch(bus)), self.a);
+                    self.writeBus(bus, 0xff00 | @as(u16, self.fetch(bus)), self.a);
                     break :blk 12;
                 },
                 5 => blk: {
@@ -255,7 +262,7 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                     break :blk 16;
                 },
                 6 => blk: {
-                    self.a = bus.read(0xff00 | @as(u16, self.fetch(bus)));
+                    self.a = self.readBus(bus, 0xff00 | @as(u16, self.fetch(bus)));
                     break :blk 12;
                 },
                 7 => blk: {
@@ -300,19 +307,19 @@ fn execute(self: *Cpu, bus: anytype, opcode: u8) Error!u8 {
                     break :blk 12;
                 },
                 4 => blk: {
-                    bus.write(0xff00 | @as(u16, self.c), self.a);
+                    self.writeBus(bus, 0xff00 | @as(u16, self.c), self.a);
                     break :blk 8;
                 },
                 5 => blk: {
-                    bus.write(self.fetch16(bus), self.a);
+                    self.writeBus(bus, self.fetch16(bus), self.a);
                     break :blk 16;
                 },
                 6 => blk: {
-                    self.a = bus.read(0xff00 | @as(u16, self.c));
+                    self.a = self.readBus(bus, 0xff00 | @as(u16, self.c));
                     break :blk 8;
                 },
                 7 => blk: {
-                    self.a = bus.read(self.fetch16(bus));
+                    self.a = self.readBus(bus, self.fetch16(bus));
                     break :blk 16;
                 },
                 else => unreachable,
@@ -402,13 +409,38 @@ fn executeCb(self: *Cpu, bus: anytype, opcode: u8) u8 {
 }
 
 fn fetch(self: *Cpu, bus: anytype) u8 {
-    const value = bus.read(self.pc);
+    const value = self.readBus(bus, self.pc);
     if (self.halt_bug) {
         self.halt_bug = false;
     } else {
         self.pc +%= 1;
     }
     return value;
+}
+
+fn readBus(self: *Cpu, bus: anytype, address: u16) u8 {
+    const value = bus.read(address);
+    self.tick(bus, 4);
+    return value;
+}
+
+fn writeBus(self: *Cpu, bus: anytype, address: u16, value: u8) void {
+    bus.write(address, value);
+    self.tick(bus, 4);
+}
+
+fn tickRemainder(self: *Cpu, bus: anytype, total_cycles: u8) void {
+    if (total_cycles > self.step_elapsed_cycles) self.tick(bus, total_cycles - self.step_elapsed_cycles);
+}
+
+fn tick(self: *Cpu, bus: anytype, cycles: u8) void {
+    self.step_elapsed_cycles += cycles;
+    const BusType = @TypeOf(bus);
+    const BusChild = switch (@typeInfo(BusType)) {
+        .pointer => |pointer| pointer.child,
+        else => BusType,
+    };
+    if (comptime @hasDecl(BusChild, "tick")) bus.tick(cycles);
 }
 
 fn fetch16(self: *Cpu, bus: anytype) u16 {
@@ -425,7 +457,7 @@ fn readR(self: *Cpu, bus: anytype, index: u8) u8 {
         3 => self.e,
         4 => self.h,
         5 => self.l,
-        6 => bus.read(self.hl()),
+        6 => self.readBus(bus, self.hl()),
         7 => self.a,
         else => unreachable,
     };
@@ -439,7 +471,7 @@ fn writeR(self: *Cpu, bus: anytype, index: u8, value: u8) void {
         3 => self.e = value,
         4 => self.h = value,
         5 => self.l = value,
-        6 => bus.write(self.hl(), value),
+        6 => self.writeBus(bus, self.hl(), value),
         7 => self.a = value,
         else => unreachable,
     }
@@ -617,15 +649,15 @@ fn condition(self: *const Cpu, index: u8) bool {
 
 fn push16(self: *Cpu, bus: anytype, value: u16) void {
     self.sp -%= 1;
-    bus.write(self.sp, @truncate(value >> 8));
+    self.writeBus(bus, self.sp, @truncate(value >> 8));
     self.sp -%= 1;
-    bus.write(self.sp, @truncate(value));
+    self.writeBus(bus, self.sp, @truncate(value));
 }
 
 fn pop16(self: *Cpu, bus: anytype) u16 {
-    const low = bus.read(self.sp);
+    const low = self.readBus(bus, self.sp);
     self.sp +%= 1;
-    const high = bus.read(self.sp);
+    const high = self.readBus(bus, self.sp);
     self.sp +%= 1;
     return @as(u16, low) | (@as(u16, high) << 8);
 }
@@ -717,6 +749,7 @@ fn setZnhc(self: *Cpu, z: bool, n: bool, h: bool, c: bool) void {
 
 const TestMemory = struct {
     data: [65536]u8 = [_]u8{0} ** 65536,
+    ticked_cycles: u16 = 0,
 
     pub fn read(self: *@This(), address: u16) u8 {
         return self.data[address];
@@ -724,6 +757,10 @@ const TestMemory = struct {
 
     pub fn write(self: *@This(), address: u16, value: u8) void {
         self.data[address] = value;
+    }
+
+    pub fn tick(self: *@This(), cycles: u8) void {
+        self.ticked_cycles += cycles;
     }
 };
 
@@ -768,6 +805,31 @@ test "services interrupts and implements delayed EI" {
         (try cpu.step(&memory, 1, &interrupt_flags)).cycles,
     );
     try std.testing.expectEqual(@as(u16, 0x40), cpu.pc);
+}
+
+test "machine-cycle hook receives instruction and interrupt timing" {
+    var memory = TestMemory{};
+    var cpu = Cpu{ .sp = 0xfffe };
+    var interrupt_flags: u8 = 0;
+    memory.data[0] = 0x00; // NOP
+    memory.data[1] = 0xcd; // CALL $0010
+    memory.data[2] = 0x10;
+    memory.data[3] = 0x00;
+    memory.data[0x10] = 0xc9; // RET
+
+    try std.testing.expectEqual(@as(u8, 4), (try cpu.step(&memory, 0, &interrupt_flags)).cycles);
+    try std.testing.expectEqual(@as(u16, 4), memory.ticked_cycles);
+
+    memory.ticked_cycles = 0;
+    try std.testing.expectEqual(@as(u8, 24), (try cpu.step(&memory, 0, &interrupt_flags)).cycles);
+    try std.testing.expectEqual(@as(u16, 24), memory.ticked_cycles);
+
+    memory.ticked_cycles = 0;
+    cpu.ime = true;
+    interrupt_flags = 0x02;
+    memory.data[0xffff] = 0x02;
+    try std.testing.expectEqual(@as(u8, 20), (try cpu.step(&memory, 0x02, &interrupt_flags)).cycles);
+    try std.testing.expectEqual(@as(u16, 20), memory.ticked_cycles);
 }
 
 test "DI cancels pending delayed EI" {
